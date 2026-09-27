@@ -4,6 +4,12 @@
 
 Μικρή desktop εφαρμογή [tinyjs](https://tinyjs.app/) για **Linux** και **Windows** που δείχνει τον επόμενο αγώνα Formula 1 και σε ειδοποιεί με native notifications του συστήματος.
 
+## Στιγμιότυπα
+
+| Επόμενος αγώνας | Βαθμολογία οδηγών | Ημερολόγιο |
+| --- | --- | --- |
+| ![Αντίστροφη μέτρηση και πρόγραμμα Σαββατοκύριακου](images/nextrace_screenshot_20260927-121430.jpg) | ![Βαθμολογία πρωταθλήματος οδηγών](images/drivers_screenshot_20260927-121518.jpg) | ![Ημερολόγιο σεζόν](images/calendar_screenshot_20260927-121435.jpg) |
+
 ## Τι κάνει
 
 - Request στο [Jolpica F1 API](https://api.jolpi.ca/ergast/f1/current/next.json) (διάδοχος του Ergast)

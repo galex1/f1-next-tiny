@@ -4,6 +4,12 @@
 
 A small [tinyjs](https://tinyjs.app/) desktop app for **Linux** and **Windows** that shows the next Formula 1 race and notifies you with native system notifications.
 
+## Screenshots
+
+| Next race | Driver standings | Calendar |
+| --- | --- | --- |
+| ![Next race countdown and weekend schedule](images/nextrace_screenshot_20260927-121430.jpg) | ![Driver championship standings](images/drivers_screenshot_20260927-121518.jpg) | ![Season calendar](images/calendar_screenshot_20260927-121435.jpg) |
+
 ## What it does
 
 - Fetches the [Jolpica F1 API](https://api.jolpi.ca/ergast/f1/current/next.json) (the Ergast successor)

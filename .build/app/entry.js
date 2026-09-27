@@ -1,7 +1,11 @@
 import { createApp } from './bridge.js';
 import * as appMod from './src/main.js';
 
-const FRONTEND = "/home/galex/projects/galex/f1-next/f1-next-tiny/src/frontend";
+let FRONTEND;
+try {
+  FRONTEND = decodeURIComponent(new URL('./frontend', import.meta.url).pathname);
+  if (/^\/[A-Za-z]:\//.test(FRONTEND)) FRONTEND = FRONTEND.slice(1); // windows /C:/…
+} catch { FRONTEND = tjs.exePath.replace(/[\\/][^\\/]*$/, '') + '/frontend'; }
 
 const app = await createApp({
   htmlPath: FRONTEND + '/index.html',
@@ -53,19 +57,6 @@ const app = await createApp({
   offscreenRescue: null,
 });
 if (appMod.init) appMod.init(app);
-
-let reloadTimer = null;
-tjs.watch(FRONTEND, () => {
-  clearTimeout(reloadTimer);
-  reloadTimer = setTimeout(async () => {
-    try {
-      await app.reload();
-      console.log('tinyjs: frontend reloaded');
-    } catch (e) {
-      console.log('tinyjs: frontend reload failed:', String(e));
-    }
-  }, 150);
-});
 
 await app.done;
 tjs.exit(0);
