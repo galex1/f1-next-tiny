@@ -1,0 +1,10 @@
+{
+  "name": "f1-next",
+  "title": "F1 Next Race",
+  "size": "820x860",
+  "id": "com.tinijs.f1-next",
+  "version": "1.1.0",
+  "minTinyjsVersion": "0.42.0",
+  "activation": "regular",
+  "about": "menu"
+}

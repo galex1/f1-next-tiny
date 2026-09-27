@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F1 Next Race</title>
+<link rel="stylesheet" href="style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="asphalt" aria-hidden="true"></div>
+
+  <header class="top">
+    <div class="brand">
+      <span class="flag" aria-hidden="true"></span>
+      <div>
+        <p class="brand-name">F1 NEXT</p>
+        <p class="brand-sub">season hub</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button type="button" id="btnRefresh" class="ghost" title="Ανανέωση">↻</button>
+      <button type="button" id="btnNotify" class="ghost">Ειδοποίηση</button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs" role="tablist">
+    <button type="button" class="tab active" data-tab="next">Επόμενος</button>
+    <button type="button" class="tab" data-tab="results">Αποτελέσματα</button>
+    <button type="button" class="tab" data-tab="drivers">Οδηγοί</button>
+    <button type="button" class="tab" data-tab="teams">Ομάδες</button>
+    <button type="button" class="tab" data-tab="calendar">Ημερολόγιο</button>
+  </nav>
+
+  <main id="main">
+    <p class="status" id="status">Φόρτωση…</p>
+  </main>
+
+  <footer class="foot">
+    <label class="tog">
+      <input type="checkbox" id="notifyEnabled" checked>
+      <span>Ειδοποιήσεις συστήματος</span>
+    </label>
+    <p class="meta" id="meta"></p>
+  </footer>
+
+<script src="app.js"></script>
+</body>
+</html>
