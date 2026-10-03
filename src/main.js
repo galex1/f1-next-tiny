@@ -68,24 +68,232 @@ async function fetchNext() {
   return normalizeRace(races[0]);
 }
 
-function mapRaceResults(race) {
-  const base = normalizeRace(race);
-  const results = (race.Results || []).map((r) => ({
+function ergastDriver(r) {
+  return {
+    code: r.Driver?.code || '',
+    name: [r.Driver?.givenName, r.Driver?.familyName].filter(Boolean).join(' '),
+    number: r.number || r.Driver?.permanentNumber || '',
+    nationality: r.Driver?.nationality || '',
+  };
+}
+
+function mapRaceRows(list) {
+  return (list || []).map((r) => ({
     position: r.positionText || r.position,
     points: Number(r.points) || 0,
     grid: r.grid != null ? Number(r.grid) : null,
     laps: r.laps != null ? Number(r.laps) : null,
     status: r.status || '',
     time: r.Time?.time || null,
-    driver: {
-      code: r.Driver?.code || '',
-      name: [r.Driver?.givenName, r.Driver?.familyName].filter(Boolean).join(' '),
-      number: r.number || r.Driver?.permanentNumber || '',
-      nationality: r.Driver?.nationality || '',
-    },
+    driver: ergastDriver(r),
     team: r.Constructor?.name || '',
   }));
-  return { ...base, results };
+}
+
+function mapRaceResults(race) {
+  return { ...normalizeRace(race), results: mapRaceRows(race.Results) };
+}
+
+function formatLap(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n)) return '';
+  const sign = n < 0 ? '-' : '';
+  const abs = Math.abs(n);
+  const mins = Math.floor(abs / 60);
+  const sec = (abs - mins * 60).toFixed(3).padStart(6, '0');
+  return sign + (mins ? mins + ':' + sec : sec);
+}
+
+function formatGap(gap) {
+  const n = Number(gap);
+  if (!Number.isFinite(n) || n === 0) return '';
+  if (Math.abs(n) < 60) return (n > 0 ? '+' : '') + n.toFixed(3);
+  return (n > 0 ? '+' : '') + formatLap(n);
+}
+
+async function openGet(url) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) return data;
+      }
+    } catch (_) {}
+    await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+  }
+  return [];
+}
+
+function openSessionKey(session) {
+  const name = String(session?.session_name || '').toLowerCase();
+  if (name === 'practice 1') return 'FirstPractice';
+  if (name === 'practice 2') return 'SecondPractice';
+  if (name === 'practice 3') return 'ThirdPractice';
+  if (name === 'sprint qualifying' || name === 'sprint shootout') return 'SprintQualifying';
+  if (name === 'sprint') return 'Sprint';
+  if (name === 'qualifying') return 'Qualifying';
+  if (name === 'race') return 'Race';
+  return null;
+}
+
+function meetingForRace(race, meetings) {
+  const list = meetings || [];
+  const exact = list.find((m) => sameVenue(race, m));
+  if (exact) return exact;
+  const locals = [race?.circuit?.locality, race?.circuit?.name];
+  const byPlace = list.find((m) => {
+    const remotes = [m.location, m.circuit_short_name, m.meeting_name];
+    return locals.some((a) => remotes.some((b) => placesMatch(a, b)));
+  });
+  if (byPlace) return byPlace;
+  const start = race?.sessions?.[0]?.startsAt || race?.startsAt;
+  const end = race?.startsAt;
+  if (!start || !end) return null;
+  const a = new Date(start).getTime();
+  const b = new Date(end).getTime();
+  return (
+    list.find((m) => {
+      const ms = new Date(m.date_start).getTime();
+      const me = new Date(m.date_end).getTime();
+      return Number.isFinite(ms) && Number.isFinite(me) && ms <= b && me >= a;
+    }) || null
+  );
+}
+
+function sessionStarted(race, key) {
+  const s = race?.sessions?.find((x) => x.key === key);
+  return !!(s?.startsAt && new Date(s.startsAt).getTime() <= Date.now());
+}
+
+async function attachQualifying(race) {
+  if (!sessionStarted(race, 'Qualifying')) return;
+  const slot = race.sessions.find((s) => s.key === 'Qualifying');
+  if (!slot || slot.rows?.length) return;
+  const data = await apiGet(`/${race.season}/${race.round}/qualifying.json`);
+  const rows = data?.MRData?.RaceTable?.Races?.[0]?.QualifyingResults || [];
+  if (!rows.length) return;
+  slot.table = 'quali';
+  slot.rows = rows.map((r) => ({
+    position: r.position,
+    driver: ergastDriver(r),
+    team: r.Constructor?.name || '',
+    q1: r.Q1 || '',
+    q2: r.Q2 || '',
+    q3: r.Q3 || '',
+  }));
+}
+
+async function attachSprint(race) {
+  if (!sessionStarted(race, 'Sprint')) return;
+  const slot = race.sessions.find((s) => s.key === 'Sprint');
+  if (!slot || slot.rows?.length) return;
+  const data = await apiGet(`/${race.season}/${race.round}/sprint.json`);
+  const rows = data?.MRData?.RaceTable?.Races?.[0]?.SprintResults || [];
+  if (!rows.length) return;
+  slot.table = 'race';
+  slot.rows = mapRaceRows(rows);
+}
+
+async function attachOpenF1Sessions(race, media) {
+  const wanted = new Set(['FirstPractice', 'SecondPractice', 'ThirdPractice', 'SprintQualifying']);
+  if (![...wanted].some((key) => sessionStarted(race, key))) return;
+  const meeting = meetingForRace(race, media?.meetings);
+  if (!meeting) return;
+  const sessions = await openGet(
+    'https://api.openf1.org/v1/sessions?meeting_key=' + encodeURIComponent(meeting.meeting_key),
+  );
+  const now = Date.now();
+  const targets = sessions.filter((s) => {
+    const key = openSessionKey(s);
+    return key && wanted.has(key) && new Date(s.date_start).getTime() <= now;
+  });
+  if (!targets.length) return;
+  const known = media?.byNumber || new Map();
+  const ergast = new Map();
+  for (const slot of race.sessions || []) {
+    for (const row of slot.rows || []) {
+      const n = Number(row.driver?.number);
+      if (n && !ergast.has(n)) ergast.set(n, row);
+    }
+  }
+  for (const s of targets) {
+    const key = openSessionKey(s);
+    const slot = race.sessions.find((x) => x.key === key);
+    if (!slot || slot.rows?.length) continue;
+    const result = await openGet(
+      'https://api.openf1.org/v1/session_result?session_key=' + encodeURIComponent(s.session_key),
+    );
+    if (!result.length) continue;
+    result.sort((a, b) => Number(a.position) - Number(b.position));
+    const knockout = result.some((row) => Array.isArray(row.duration));
+    slot.table = knockout ? 'quali' : 'practice';
+    slot.rows = result.map((row) => {
+      const n = Number(row.driver_number);
+      const d = known.get(n) || {};
+      const fallback = ergast.get(n);
+      const status = row.dsq ? 'DSQ' : row.dnf ? 'DNF' : row.dns ? 'DNS' : '';
+      const times = (Array.isArray(row.duration) ? row.duration : [row.duration]).map((v) =>
+        Number.isFinite(Number(v)) ? formatLap(Number(v)) : '',
+      );
+      const gapValue = Array.isArray(row.gap_to_leader) ? row.gap_to_leader.filter((v) => v != null).pop() : row.gap_to_leader;
+      return {
+        position: row.position,
+        driver: {
+          code: d.name_acronym || fallback?.driver?.code || '',
+          name:
+            [d.first_name, d.last_name].filter(Boolean).join(' ') ||
+            d.full_name ||
+            fallback?.driver?.name ||
+            '',
+          number: n ? String(n) : '',
+          nationality: fallback?.driver?.nationality || '',
+          photo: d.headshot_url || fallback?.driver?.photo || '',
+          flag: fallback?.driver?.flag || '',
+        },
+        team: d.team_name || fallback?.team || '',
+        teamColour: hexColour(d.team_colour) || fallback?.teamColour || '',
+        time: status || times.filter(Boolean).pop() || '',
+        gap: row.position === 1 ? '' : formatGap(gapValue),
+        laps: row.number_of_laps ?? '',
+        q1: times[0] || '',
+        q2: times[1] || '',
+        q3: times[2] || '',
+      };
+    });
+  }
+}
+
+function paintRow(row, media) {
+  paintDriver(row.driver);
+  if (!media) return;
+  const src = media.byCode.get(String(row.driver?.code || '').toUpperCase());
+  if (src?.headshot_url && !row.driver.photo) row.driver.photo = src.headshot_url;
+  if (!row.teamColour) {
+    const col = media.colours.get(teamKey(row.team));
+    if (col) row.teamColour = col;
+  }
+}
+
+async function attachClassifications(race, media) {
+  if (!race?.season || !race?.round) return;
+  if (!race.sessions?.some((s) => s.key !== 'Race')) {
+    const data = await apiGet(`/${race.season}/${race.round}.json`).catch(() => null);
+    const raw = data?.MRData?.RaceTable?.Races?.[0];
+    if (raw) race.sessions = normalizeRace(raw).sessions;
+  }
+  if (!race.sessions) return;
+  await attachQualifying(race).catch(() => {});
+  await attachSprint(race).catch(() => {});
+  await attachOpenF1Sessions(race, media).catch(() => {});
+  for (const slot of race.sessions) {
+    for (const row of slot.rows || []) paintRow(row, media);
+  }
+  const raceSession = race.sessions.find((s) => s.key === 'Race');
+  if (raceSession && race.results?.length && !raceSession.rows?.length) {
+    raceSession.table = 'race';
+    raceSession.rows = race.results;
+  }
 }
 
 async function fetchLastResults() {
@@ -283,16 +491,20 @@ async function ensureMedia(year) {
       .catch(() => []),
   ]);
   const byCode = new Map();
+  const byNumber = new Map();
   const colours = new Map();
   for (const d of openDrivers || []) {
     const code = String(d.name_acronym || '').toUpperCase();
     if (code) byCode.set(code, d);
+    const num = Number(d.driver_number);
+    if (num && !byNumber.has(num)) byNumber.set(num, d);
     const col = hexColour(d.team_colour);
     if (col) colours.set(teamKey(d.team_name), col);
   }
   mediaCache = {
     year: y,
     byCode,
+    byNumber,
     colours,
     meetings: (meetings || []).filter(
       (m) => !/test/i.test(m.meeting_name || '') && (m.country_flag || m.circuit_image),
@@ -344,6 +556,10 @@ async function enrichMedia(cache) {
   paintRace(cache.next);
   paintResult(cache.results, media);
   for (const race of cache.calendar?.races || []) paintRace(race);
+  const classified = [];
+  if (cache.next) classified.push(attachClassifications(cache.next, media));
+  if (cache.results) classified.push(attachClassifications(cache.results, media));
+  await Promise.all(classified);
 }
 
 async function refreshAll(force) {
@@ -512,6 +728,7 @@ export const api = {
     const result = await fetchRoundResults(season, round);
     const media = await ensureMedia(season);
     paintResult(result, media);
+    await attachClassifications(result, media);
     return result;
   },
 

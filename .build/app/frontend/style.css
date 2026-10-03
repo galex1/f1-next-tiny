@@ -477,6 +477,37 @@ main {
   text-transform: uppercase;
 }
 .session.past { opacity: 0.45; }
+.session.has-rows {
+  cursor: pointer;
+  opacity: 1;
+}
+.session.has-rows:hover { background: rgba(255, 255, 255, 0.03); }
+.session.selected {
+  opacity: 1;
+  box-shadow: inset 3px 0 0 var(--red);
+  padding-left: 10px;
+}
+
+.board { margin-top: 4px; }
+.board-title {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 22px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1.05;
+  margin: 2px 0 8px;
+}
+.picks {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 4px 0 10px;
+}
+.picks button.active {
+  border-color: var(--red);
+  color: var(--ink);
+}
 
 .cta-row {
   display: flex;

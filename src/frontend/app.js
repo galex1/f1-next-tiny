@@ -34,6 +34,7 @@ let data = null;
 let activeTab = 'next';
 let tickTimer = null;
 let raceView = null;
+const boardPick = { next: null, results: null, calendar: null };
 
 function fmtParts(iso) {
   if (!iso) return null;
@@ -118,17 +119,105 @@ function renderCountdown() {
     .join('');
 }
 
+function classifiedSessions(race) {
+  const list = (race?.sessions || []).filter((s) => s.rows?.length);
+  if (race?.results?.length && !list.some((s) => s.key === 'Race')) {
+    list.push({ key: 'Race', label: 'Race', table: 'race', rows: race.results });
+  }
+  return list;
+}
+
+function chosenSession(race, scope) {
+  const list = classifiedSessions(race);
+  if (!list.length) return null;
+  const saved = boardPick[scope];
+  if (
+    saved &&
+    String(saved.season) === String(race.season) &&
+    String(saved.round) === String(race.round)
+  ) {
+    const hit = list.find((s) => s.key === saved.key);
+    if (hit) return hit;
+  }
+  if (scope === 'next') {
+    const nonRace = list.filter((s) => s.key !== 'Race');
+    return nonRace[nonRace.length - 1] || list[list.length - 1];
+  }
+  return list.find((s) => s.key === 'Race') || list[list.length - 1];
+}
+
+function classTable(session) {
+  if (!session?.rows?.length) return '';
+  const rows = session.rows
+    .map((row) => {
+      if (session.table === 'quali') {
+        return `<tr>
+          <td class="pos">${esc(row.position)}</td>
+          <td>${driverWho(row.driver)}</td>
+          <td class="muted">${teamMark(row.teamColour)}${esc(row.team)}</td>
+          <td class="num">${esc(row.q1 || '—')}</td>
+          <td class="num">${esc(row.q2 || '—')}</td>
+          <td class="num">${esc(row.q3 || '—')}</td>
+        </tr>`;
+      }
+      if (session.table === 'practice') {
+        return `<tr>
+          <td class="pos">${esc(row.position)}</td>
+          <td>${driverWho(row.driver)}</td>
+          <td class="muted">${teamMark(row.teamColour)}${esc(row.team)}</td>
+          <td class="num">${esc(row.time || '—')}</td>
+          <td class="num">${esc(row.gap || '—')}</td>
+          <td class="num">${esc(row.laps ?? '—')}</td>
+        </tr>`;
+      }
+      return `<tr>
+        <td class="pos">${esc(row.position)}</td>
+        <td>${driverWho(row.driver)}</td>
+        <td class="muted">${teamMark(row.teamColour)}${esc(row.team)}</td>
+        <td class="num">${esc(row.time || row.status || '—')}</td>
+        <td class="num">${esc(row.points)}</td>
+      </tr>`;
+    })
+    .join('');
+  const qLabel = session.key === 'SprintQualifying' ? ['SQ1', 'SQ2', 'SQ3'] : ['Q1', 'Q2', 'Q3'];
+  const head =
+    session.table === 'quali'
+      ? `<th>#</th><th>Οδηγός</th><th>Ομάδα</th><th>${qLabel[0]}</th><th>${qLabel[1]}</th><th>${qLabel[2]}</th>`
+      : session.table === 'practice'
+        ? '<th>#</th><th>Οδηγός</th><th>Ομάδα</th><th>Χρόνος</th><th>Διαφορά</th><th>Γύροι</th>'
+        : '<th>#</th><th>Οδηγός</th><th>Ομάδα</th><th>Χρόνος</th><th>Βαθμοί</th>';
+  return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function sessionPicks(race, scope) {
+  const list = classifiedSessions(race);
+  if (list.length < 2) return '';
+  const current = chosenSession(race, scope);
+  return (
+    `<div class="picks">` +
+    list
+      .map(
+        (s) =>
+          `<button type="button" class="ghost${s.key === current?.key ? ' active' : ''}" data-board="${esc(scope)}" data-key="${esc(s.key)}">${esc(s.label)}</button>`,
+      )
+      .join('') +
+    `</div>`
+  );
+}
+
 function renderSessions(race) {
   if (!race?.sessions?.length) return '';
   const now = Date.now();
+  const current = chosenSession(race, 'next');
   return (
     `<div class="sessions">` +
     race.sessions
       .map((s) => {
         const past = s.startsAt && new Date(s.startsAt).getTime() < now - 90 * 60 * 1000;
         const isRace = s.key === 'Race';
+        const open = !!s.rows?.length;
         const t = fmtSession(s.startsAt);
-        return `<div class="session${isRace ? ' is-race' : ''}${past ? ' past' : ''}">
+        return `<div class="session${isRace ? ' is-race' : ''}${past ? ' past' : ''}${open ? ' has-rows' : ''}${open && s.key === current?.key ? ' selected' : ''}"${open ? ` data-board="next" data-key="${esc(s.key)}"` : ''}>
           <span class="label">${esc(s.label)}</span>
           <span class="time">${esc(t.line)}<br><span class="time-date">${esc(t.date)}</span></span>
         </div>`;
@@ -136,6 +225,18 @@ function renderSessions(race) {
       .join('') +
     `</div>`
   );
+}
+
+function renderClassBoard(race, scope) {
+  const session = chosenSession(race, scope);
+  if (!session) return '';
+  return `
+    <div class="board">
+      <p class="round">Κατάταξη</p>
+      <h2 class="board-title">${esc(session.label)}</h2>
+      ${classTable(session)}
+    </div>
+  `;
 }
 
 function renderNext() {
@@ -159,26 +260,17 @@ function renderNext() {
       <div class="countdown" id="cd"></div>
     </div>
     ${renderSessions(race)}
+    ${renderClassBoard(race, 'next')}
   `;
 }
 
-function resultTable(r, heading) {
-  if (!r?.results?.length) return `<p class="status">Δεν υπάρχουν αποτελέσματα ακόμα.</p>`;
+function resultTable(r, heading, scope) {
+  const session = r ? chosenSession(r, scope) : null;
+  if (!session) return `<p class="status">Δεν υπάρχουν αποτελέσματα ακόμα.</p>`;
   const place = [r.circuit.locality, r.circuit.country].filter(Boolean).join(' · ');
   const track = r.circuitImage
     ? `<img class="circuit-img" src="${esc(r.circuitImage)}" alt="">`
     : '';
-  const rows = r.results
-    .map(
-      (row) => `<tr>
-        <td class="pos">${esc(row.position)}</td>
-        <td>${driverWho(row.driver)}</td>
-        <td class="muted">${teamMark(row.teamColour)}${esc(row.team)}</td>
-        <td class="num">${esc(row.time || row.status || '—')}</td>
-        <td class="num">${esc(row.points)}</td>
-      </tr>`,
-    )
-    .join('');
   return `
     <div class="hero">
       ${track}
@@ -189,17 +281,13 @@ function resultTable(r, heading) {
         <p class="when muted-line">${esc(fmtBoth(r.startsAt))}</p>
       </div>
     </div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>#</th><th>Οδηγός</th><th>Ομάδα</th><th>Χρόνος</th><th>Βαθμοί</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
+    ${sessionPicks(r, scope)}
+    ${classTable(session)}
   `;
 }
 
 function renderResults() {
-  return resultTable(data?.results, `Τελευταίος αγώνας · R${data?.results?.round || ''}`);
+  return resultTable(data?.results, `Τελευταίος αγώνας · R${data?.results?.round || ''}`, 'results');
 }
 
 function renderDrivers() {
@@ -262,7 +350,7 @@ function renderRaceDetail() {
   const back = `<div class="cta-row"><button type="button" class="ghost" id="backCal">← Ημερολόγιο</button></div>`;
   if (raceView.loading) return `${back}<p class="status">Φόρτωση αποτελεσμάτων…</p>`;
   if (raceView.error) return `${back}<p class="status err">${esc(raceView.error)}</p>`;
-  return back + resultTable(raceView.race, `Αγώνας · R${esc(raceView.race?.round || '')}`);
+  return back + resultTable(raceView.race, `Αγώνας · R${esc(raceView.race?.round || '')}`, 'calendar');
 }
 
 function renderCalendar() {
@@ -295,7 +383,7 @@ function renderCalendar() {
     <div>
       <p class="round">Season ${esc(cal.season)}</p>
       <h2 class="section-title">Ημερολόγιο</h2>
-      <p class="muted small">Πάτα έναν περασμένο αγώνα για τα αποτελέσματά του.</p>
+      <p class="muted small">Πάτα έναν περασμένο αγώνα για τον αγώνα, τα δοκιμαστικά και το qualifying.</p>
     </div>
     <div class="table-wrap">
       <table class="cal">
@@ -420,6 +508,16 @@ async function init() {
   $('tabs').addEventListener('click', (ev) => {
     const btn = ev.target.closest('.tab');
     if (btn?.dataset.tab) setTab(btn.dataset.tab);
+  });
+  $('main').addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-board]');
+    if (!el) return;
+    const scope = el.dataset.board;
+    const race =
+      scope === 'next' ? data?.race : scope === 'results' ? data?.results : raceView?.race;
+    if (!race || !el.dataset.key) return;
+    boardPick[scope] = { key: el.dataset.key, season: race.season, round: race.round };
+    render();
   });
   $('btnRefresh').addEventListener('click', () => load(true));
   $('btnNotify').addEventListener('click', () => tiny.api.call('notifyNow'));
