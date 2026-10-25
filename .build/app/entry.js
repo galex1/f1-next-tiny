@@ -6,14 +6,18 @@ try {
   FRONTEND = decodeURIComponent(new URL('./frontend', import.meta.url).pathname);
   if (/^\/[A-Za-z]:\//.test(FRONTEND)) FRONTEND = FRONTEND.slice(1); // windows /C:/…
 } catch { FRONTEND = tjs.exePath.replace(/[\\/][^\\/]*$/, '') + '/frontend'; }
+const RESOURCES = null;
+const EXECUTABLES = null;
 
 const app = await createApp({
   htmlPath: FRONTEND + '/index.html',
   title: "F1 Next Race",
   size: "820x860",
   version: "1.1.0",
-  tinyjsVersion: "v0.42.0",
+  tinyjsVersion: "v0.65.0",
   id: "com.tinijs.f1-next",
+  resourcesPath: RESOURCES,
+  executablesPath: EXECUTABLES,
   api: appMod.api ?? {},
   onMenu: appMod.onMenu,
   onTray: appMod.onTray,
@@ -42,6 +46,7 @@ const app = await createApp({
   chrome: null,
   update: null,
   activation: "regular",
+  mainWindow: true,
   readAccess: null,
   userAgent: null,
   audioTap: null,
@@ -55,8 +60,15 @@ const app = await createApp({
   openFolders: false,
   permissions: null,
   offscreenRescue: null,
+  rememberWindows: false,
 });
 if (appMod.init) appMod.init(app);
 
-await app.done;
+const launcherSt = await app.done;
+if (launcherSt?.term_signal || launcherSt?.exit_status) {
+  console.error('tinyjs: webview launcher ' + (launcherSt.term_signal
+    ? 'killed by ' + launcherSt.term_signal
+    : 'exited with status ' + launcherSt.exit_status));
+  tjs.exit(launcherSt.exit_status || 1);
+}
 tjs.exit(0);

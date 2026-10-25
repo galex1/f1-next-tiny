@@ -196,7 +196,13 @@ async function attachSprint(race) {
 }
 
 async function attachOpenF1Sessions(race, media) {
-  const wanted = new Set(['FirstPractice', 'SecondPractice', 'ThirdPractice', 'SprintQualifying']);
+  const wanted = new Set([
+    'FirstPractice',
+    'SecondPractice',
+    'ThirdPractice',
+    'SprintQualifying',
+    'Qualifying',
+  ]);
   if (![...wanted].some((key) => sessionStarted(race, key))) return;
   const meeting = meetingForRace(race, media?.meetings);
   if (!meeting) return;
