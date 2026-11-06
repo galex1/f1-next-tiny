@@ -14,7 +14,7 @@ const app = await createApp({
   title: "F1 Next Race",
   size: "820x860",
   version: "1.1.0",
-  tinyjsVersion: "v0.65.0",
+  tinyjsVersion: "v0.71.1",
   id: "com.tinijs.f1-next",
   resourcesPath: RESOURCES,
   executablesPath: EXECUTABLES,

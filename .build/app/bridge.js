@@ -51,15 +51,15 @@ const ON_X11 = IS_LINUX && (tjs.env.GDK_BACKEND === 'x11'
 // Windows: argv transform that routes a console command through
 // `launcher --run` (CREATE_NO_WINDOW) so no terminal window flashes when a
 // GUI-subsystem app shells out — tjs.spawn has no flag for this. Identity
-// everywhere else. Module-scoped because the fetch shim's curl hops and
-// probeOk run outside createApp, where the launcher path is otherwise found.
+// everywhere else. Module-scoped because probeOk runs outside createApp, where
+// the launcher path is otherwise found.
 let runPrefix = null;               // ['<launcher>', '--run'] once known
 let runPrefixTried = false;
 const hiddenArgv = (args) => (runPrefix ? [...runPrefix, ...args] : args);
 // createApp sets runPrefix (it validates the path and honors the launcherPath
-// option), but a backend's module top level runs BEFORE createApp — and a
-// fetch there is exactly a case that can need curl. So resolve it on first
-// use too, with createApp's precedence minus the option it can't see.
+// option), but a backend's module top level runs BEFORE createApp, and it can
+// reach probeOk from there. So resolve it on first use too, with createApp's
+// precedence minus the option it can't see.
 async function readyHiddenArgv() {
   if (!IS_WIN || runPrefix || runPrefixTried) return;
   runPrefixTried = true;
@@ -72,185 +72,206 @@ async function readyHiddenArgv() {
   } catch {}                        // no launcher yet: plain spawn, as before
 }
 
-// ── fetch repair shim ───────────────────────────────────────────────────────
-// txiki v26.6.0's fetch has two wire-level bugs (repros + fix notes in
-// TODO-txiki.md; both verified against real hosts):
-//   A. a root-path URL goes out as 'GET //' — S3/CloudFront-backed hosts
-//      answer 404 to the double slash (Radiotopia's publicfeeds.net feeds,
-//      pdrl.fm's redirect targets)
-//   B. mbedtls never completes a handshake with TLS 1.2-only hosts
-//      ("mbedtls connect -1 5 0" — rss.art19.com, anchor.fm, Fastly's
-//      older TLS profiles)
-// Until a patched tjs ships, wrap fetch: follow redirects ourselves so every
-// hop is visible, and route EXACTLY the broken cases through the system curl
-// (always present on macOS/Linux; Windows ships curl.exe since 10 1803).
-// A real HTTP error from a working request is never retried — a genuine 404
-// stays a 404 — and curl bodies stream, so internet radio stays live. Both
+// ── fetch: the redirect rules native fetch doesn't apply ─────────────────────
+// txiki's native fetch follows redirects without any of the rules a browser
+// applies to them (measured on 26.11.0, repros in TODO-txiki.md):
+//   - a Location on another scheme (file:///etc/passwd) throws outside the
+//     returned promise: nothing can catch it and the process exits
+//   - Authorization and Cookie go along to whatever origin the server names
+//   - a POST turned into a GET keeps its Content-Type
+// So redirects are followed here, one `redirect: 'manual'` hop at a time. Both
 // backend fetch() and every page's tiny.fetch inherit this.
+//
+// A GET or HEAD the runtime can't make goes through the system curl (always on
+// macOS and Linux distros; Windows ships curl.exe since 10 1803). txiki 26.11.0
+// can't reach RSA-only servers and doesn't read the OS's certificates, and
+// curl can do both (TODO-txiki.md). Only when no response existed: a real HTTP
+// error stays an error, and other methods aren't sent twice.
 const nativeFetch = globalThis.fetch?.bind(globalThis);
+// By full path on Windows, as update.js does for tar: a bare name is also looked
+// up in the current directory there, so a curl.exe planted beside a file the app
+// was opened from would run.
+const CURL = IS_WIN
+  ? (tjs.env.SystemRoot || tjs.env.SYSTEMROOT || 'C:\\Windows') + '\\System32\\curl.exe'
+  : 'curl';
 let curlProbe = null;
-const haveCurl = () => (curlProbe ??= probeOk(['curl', '--version']));
+const haveCurl = () => (curlProbe ??= probeOk([CURL, '--version']));
+// More than any real server sends, and curl -i would otherwise have this buffer a
+// hostile server's endless "headers" without limit.
+const CURL_MAX_HEADERS = 512 * 1024;
+
+// Where the first blank line starts and how long it is. Bytes, because a body
+// may follow that isn't text, and both endings, because curl -i passes on a
+// server's bare LFs as they came.
+function headerEnd(b, from) {
+  for (let i = from; i + 1 < b.length; i++) {
+    if (b[i] !== 10) continue;
+    if (b[i + 1] === 10) return { at: i, len: 2 };
+    if (b[i + 1] === 13 && b[i + 2] === 10) return { at: i, len: 3 };
+  }
+  return null;
+}
+
+// One GET or HEAD hop via curl, returned as a real Response with a streaming
+// body, so internet radio stays live. -i puts the header block on stdout ahead
+// of the body; no -L, since the wrapper follows redirects itself.
+async function curlFetch(url, { method, headers, signal }) {
+  // -q has to come first: it skips ~/.curlrc, which could redirect, add headers
+  // or turn off TLS checks behind the rules here. --globoff keeps curl from
+  // expanding [] and {} in a URL into other requests. --proto locks it to http(s).
+  // --suppress-connect-headers keeps a CONNECT proxy's own reply out of -i's output,
+  // where it would be taken for the response. Needs curl 7.54, older than the 7.55
+  // required below.
+  const args = [CURL, '-q', '--globoff', '-s', '-i', '--suppress-connect-headers',
+    '--connect-timeout', '30', '--proto', '=http,https'];
+  if (method === 'HEAD') args.push('--head');
+  // Headers and URL go through files in a 0700 temp dir, never argv: argv is
+  // readable by every local user via `ps`, and headers carry Authorization /
+  // Cookie (#27), and URLs can carry tokens. `headers` already passed new
+  // Headers(), which refuses CR/LF, and href has none. "Name;" is curl's spelling
+  // for sending a header empty. `-H @file` needs curl 7.55 (2017; Windows 10
+  // 1803's curl.exe is 7.55.1).
+  const lines = [];
+  let encoding = false;
+  headers.forEach((v, k) => {
+    if (k === 'accept-encoding') encoding = true;
+    lines.push(String(v).trim() === '' ? k + ';' : k + ': ' + v);
+  });
+  // curl won't decode what we don't tell the server to send
+  if (!encoding) lines.push('accept-encoding: identity');
+  const ioDir = await tjs.makeTempDir(tjs.tmpDir + '/tinyjs-fetch-XXXXXX');
+  const dropIo = () => tjs.remove(ioDir, { recursive: true }).catch(() => {});
+  let p;
+  try {
+    const target = new URL(url).href.replace(/[\\"]/g, '\\$&');
+    await tjs.writeFile(ioDir + '/headers', enc.encode(lines.join('\n') + '\n'));
+    await tjs.writeFile(ioDir + '/config', enc.encode(`url = "${target}"\n`));
+    args.push('-H', '@' + ioDir + '/headers', '--config', ioDir + '/config');
+    // hiddenArgv: curl.exe would otherwise flash a console window from a
+    // GUI-subsystem app
+    await readyHiddenArgv();
+    p = tjs.spawn(hiddenArgv(args), { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' });
+  } catch (e) { await dropIo(); throw e; }
+  p.wait().then(dropIo, dropIo);
+  const kill = () => { try { p.kill(); } catch {} };
+  // A server that accepts and never answers mustn't leave this pending for
+  // good. Only until the headers: a stream has no end to time.
+  const noHeaders = setTimeout(kill, 30000);
+  try {
+    if (signal) signal.aborted ? kill() : signal.addEventListener('abort', kill);
+    const reader = p.stdout.getReader();
+    let buf = new Uint8Array(0), head = null, scanned = 0;
+    while (!head) {
+      const { done, value } = await reader.read();
+      if (value) {
+        const n = new Uint8Array(buf.length + value.length);
+        n.set(buf); n.set(value, buf.length); buf = n;
+      }
+      // 1xx interim blocks are skipped
+      let end;
+      while (!head && (end = headerEnd(buf, scanned))) {
+        const block = dec.decode(buf.subarray(0, end.at));
+        const m = /^HTTP\/[\d.]+ (\d{3})(?: (.*))?/.exec(block);
+        if (!m) throw new TypeError('Network request failed (not HTTP)');
+        buf = buf.subarray(end.at + end.len);
+        scanned = 0;
+        if (+m[1] >= 200) head = { status: +m[1], statusText: (m[2] || '').split(/\r?\n/)[0].trim(), block };
+      }
+      if (head) break;
+      if (buf.length > CURL_MAX_HEADERS) throw new TypeError('Network request failed (headers too large)');
+      scanned = Math.max(0, buf.length - 2);
+      if (done) break;
+    }
+    if (!head) {
+      const st = await p.wait();
+      throw new TypeError('Network request failed (curl exit ' + (st.term_signal || st.exit_status) + ')');
+    }
+    // curl has read both files by now, and they hold the caller's credentials.
+    // Awaited: a process that exits right after this must not leave them behind.
+    await dropIo();
+    const out = [];
+    for (const line of head.block.split(/\r?\n/).slice(1)) {
+      const c = line.indexOf(':');
+      if (c > 0) out.push([line.slice(0, c).trim(), line.slice(c + 1).trim()]);
+    }
+    const noBody = method === 'HEAD' || [204, 205, 304].includes(head.status);
+    const stream = noBody ? null : new ReadableStream({
+      start(c) { if (buf.length) c.enqueue(buf.slice()); },
+      async pull(c) {
+        const { done, value } = await reader.read();
+        if (done) c.close();
+        else c.enqueue(value);
+      },
+      cancel: kill,
+    });
+    const res = new Response(stream, { status: head.status, statusText: head.statusText, headers: out });
+    Object.defineProperty(res, 'url', { get: () => url });
+    return res;
+  } catch (e) {
+    // a stream nobody will read would hold curl open for good. Awaited for the
+    // same reason as above: this is the failure path of the same files.
+    kill();
+    await dropIo();
+    throw e;
+  } finally {
+    clearTimeout(noHeaders);
+  }
+}
+
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
 // Request headers a redirect must not carry to another origin (#27). WHATWG
 // fetch drops Authorization there; a browser never lets a page set Cookie or
 // Proxy-Authorization at all, but tiny.fetch does, so those go too.
-const CROSS_ORIGIN_STRIP = new Set(['authorization', 'cookie', 'proxy-authorization']);
+const CROSS_ORIGIN_STRIP = ['authorization', 'cookie', 'proxy-authorization'];
 // …and the body's own headers once a redirect turns the request into a GET.
-const BODY_HEADERS = new Set(['content-type', 'content-length', 'content-encoding',
-                              'content-language', 'content-location']);
-// A Headers object, not pairs: txiki's native fetch reads an array as a plain
-// object ({"0": "k,v", "length": …} went onto the wire, measured 26.6.0).
-const dropHeaders = (H, names) =>
-  new Headers(headerPairs(H).filter(([k]) => !names.has(String(k).toLowerCase())));
+const BODY_HEADERS = ['content-type', 'content-length', 'content-encoding',
+                      'content-language', 'content-location'];
+// new Headers() is also the gate for what a page hands tiny.fetch: it refuses
+// a name that isn't an RFC 9110 token and a value with CR/LF/NUL.
+const dropHeaders = (H, names) => {
+  const out = new Headers(H ?? undefined);
+  for (const n of names) out.delete(n);
+  return out;
+};
+// Every fetch gets its own connection, as it did before txiki 26.11.0 pooled
+// them. On 26.11.0's pool (measured, TODO-txiki.md): an open stream blocks every
+// other fetch to its origin, a fetch right after a cancel rejects, and parallel
+// fetches to one h2 host lose requests. A caller who sends any other Connection
+// value opts back in, since txiki drops that header and lets the pool decide.
+const ownConnection = (H) => {
+  const out = new Headers(H ?? undefined);
+  if (!out.has('connection')) out.set('connection', 'close');
+  return out;
+};
 
-// Header init (Headers, [[k, v], ...] or a plain object) as validated pairs.
-// WHATWG fetch rejects a name that isn't an RFC 9110 token and a value with
-// CR/LF/NUL; txiki's native fetch checks neither (measured 26.6.0: a CRLF in
-// a value went onto the wire as a separate header), and curl's -H turns a CRLF
-// into extra request lines and a ':' in the name into a different header
-// (Host included). A page's tiny.fetch lands here, so this is the gate.
-const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-function headerPairs(H) {
-  const pairs = [];
-  if (!H) return pairs;
-  if (Array.isArray(H)) for (const [k, v] of H) pairs.push([k, v]);
-  else if (typeof H.forEach === 'function') H.forEach((v, k) => pairs.push([k, v]));
-  else for (const k of Object.keys(H)) pairs.push([k, H[k]]);
-  for (const [k, v] of pairs) {
-    if (!HEADER_NAME.test(String(k))) throw new TypeError('Invalid header name: ' + JSON.stringify(String(k)));
-    if (/[\r\n\0]/.test(String(v))) throw new TypeError('Invalid header value for ' + k);
+if (nativeFetch) globalThis.fetch = async function fetchFollowingSafely(input, init = {}) {
+  // A Request is taken apart so it gets the same redirect rules. init wins over
+  // the Request, as in the spec.
+  if (typeof Request === 'function' && input instanceof Request) {
+    const hasBody = input.method !== 'GET' && input.method !== 'HEAD';
+    const bytes = hasBody && !init.body ? new Uint8Array(await input.arrayBuffer()) : null;
+    init = { method: input.method, headers: input.headers, signal: input.signal,
+             ...(bytes?.length ? { body: bytes } : {}), ...init };
+    input = input.url;
   }
-  return pairs;
-}
-
-// One hop via curl, returned as a real Response with a streaming body.
-// -i puts the header block on stdout ahead of the body; no -L — the wrapper
-// follows redirects itself, so one call is always exactly one hop.
-async function curlFetch(url, init = {}) {
-  const method = (init.method || 'GET').toUpperCase();
-  // --proto locks curl to http(s) even if a caller slips something exotic
-  // past the wrapper; --proto-redir guards curl's own redirect handling
-  // (unused — we never pass -L — but belt and braces)
-  const args = ['curl', '-s', '-i', '--connect-timeout', '30',
-                '--proto', '=http,https', '--proto-redir', '=http,https'];
-  if (method === 'HEAD') args.push('--head');
-  else if (method !== 'GET') args.push('-X', method);
-  // validated again here (fetchRepaired already did): a CRLF in an -H arg is
-  // request smuggling, so this hop doesn't lean on its caller
-  const pairs = headerPairs(init.headers);
-  // identity unless the caller asked for something: curl won't decode what we
-  // don't tell the server to send, and honest lengths beat saved bytes here
-  if (!pairs.some(([k]) => k.toLowerCase() === 'accept-encoding')) pairs.push(['accept-encoding', 'identity']);
-  // hiddenArgv: on Windows every hop would otherwise flash a console window
-  // (curl.exe is a console app, the packaged app is GUI-subsystem)
-  await readyHiddenArgv();
-  const body = init.body;
-  if (body != null && typeof body !== 'string' && !(body instanceof Uint8Array))
-    throw new TypeError('fetch fallback: only string/Uint8Array bodies');
-  // Headers and body go through files in a 0700 temp dir, never argv: argv is
-  // readable by every local user via `ps`, and headers carry Authorization /
-  // Cookie (#27). One header per line (headerPairs already refused CR/LF);
-  // "Name:" with nothing after it tells curl to REMOVE that header, "Name;"
-  // is its spelling for sending it empty. `-H @file` needs curl 7.55 (2017;
-  // Windows 10 1803's curl.exe is 7.55.1). The body is a file rather than
-  // stdin because txiki 26.6.0 never settles a spawned child's stdin write
-  // (saghul/txiki.js#1027, fixed after that release). The dir goes once curl
-  // has exited.
-  const ioDir = await tjs.makeTempDir(tjs.tmpDir + '/tinyjs-fetch-XXXXXX');
-  const dropIo = () => tjs.remove(ioDir, { recursive: true }).catch(() => {});
-  try {
-    const lines = pairs.map(([k, v]) => (String(v).trim() === '' ? k + ';' : k + ': ' + v));
-    await tjs.writeFile(ioDir + '/headers', enc.encode(lines.join('\n') + '\n'));
-    args.push('-H', '@' + ioDir + '/headers');
-    if (body != null) {
-      await tjs.writeFile(ioDir + '/body', typeof body === 'string' ? enc.encode(body) : body);
-      args.push('--data-binary', '@' + ioDir + '/body');
-    }
-  } catch (e) { dropIo(); throw e; }
-  args.push('--', url);   // never let a URL parse as a flag
-  let p;
-  try {
-    p = tjs.spawn(hiddenArgv(args), { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' });
-  } catch (e) { dropIo(); throw e; }
-  p.wait().then(dropIo, dropIo);
-  if (init.signal) {
-    const kill = () => { try { p.kill(); } catch {} };
-    init.signal.aborted ? kill() : init.signal.addEventListener('abort', kill);
-  }
-  const reader = p.stdout.getReader();
-  // accumulate until the end of the header block; 1xx interim blocks (100
-  // Continue from the --data-binary path) are skipped like a client should
-  let buf = new Uint8Array(0);
-  const blockEnd = (b, from) => {
-    for (let i = from; i + 3 < b.length; i++)
-      if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i;
-    return -1;
-  };
-  let head = null, rest = null;
-  while (head === null) {
-    const { done, value } = await reader.read();
-    if (value) {
-      const n = new Uint8Array(buf.length + value.length);
-      n.set(buf); n.set(value, buf.length); buf = n;
-    }
-    let idx;
-    while ((idx = blockEnd(buf, 0)) !== -1) {
-      const block = dec.decode(buf.subarray(0, idx));
-      buf = buf.subarray(idx + 4);
-      const m = /^HTTP\/[\d.]+ (\d{3})(?: (.*))?/.exec(block);
-      if (!m) break;                       // not HTTP — fail below
-      if (+m[1] >= 200 || +m[1] < 100) { head = { status: +m[1], statusText: m[2] || '', block }; rest = buf; break; }
-    }
-    if (done) break;
-  }
-  if (!head) {
-    const st = await p.wait();
-    throw new TypeError('Network request failed (curl exit ' + (st.term_signal || st.exit_status) + ')');
-  }
-  const headers = [];
-  for (const line of head.block.split('\r\n').slice(1)) {
-    const c = line.indexOf(':');
-    if (c > 0) headers.push([line.slice(0, c).trim(), line.slice(c + 1).trim()]);
-  }
-  const noBody = method === 'HEAD' || head.status === 204 || head.status === 304 || head.status === 205;
-  const stream = noBody ? null : new ReadableStream({
-    start(c) { if (rest.length) c.enqueue(rest.slice()); },
-    async pull(c) {
-      const { done, value } = await reader.read();
-      if (done) { c.close(); p.wait().catch(() => {}); }
-      else c.enqueue(value);
-    },
-    cancel() { try { p.kill(); } catch {} },
-  });
-  return new Response(stream, { status: head.status, statusText: head.statusText, headers });
-}
-
-if (nativeFetch) globalThis.fetch = async function fetchRepaired(input, init = {}) {
-  // before any routing: the native path needs this as much as curl does
-  headerPairs(init.headers);
-  if (input?.headers) headerPairs(input.headers);        // a Request object
-  // exotic inputs (Request objects, data:/file: urls, stream bodies) keep the
-  // native path untouched — the repair rules only understand plain http(s)
+  // exotic inputs (data:/file: urls) keep the native path untouched — the rules
+  // here only understand plain http(s)
   const url0 = typeof input === 'string' ? input : (input instanceof URL ? input.href : null);
   if (url0 === null || !/^https?:\/\//i.test(url0)) return nativeFetch(input, init);
   const mode = init.redirect || 'follow';
   let url = url0;
   let method = (init.method || 'GET').toUpperCase();
   let body = init.body;
-  let headers = init.headers;
+  let headers = ownConnection(init.headers);
   for (let hop = 0; ; hop++) {
-    let rootPath = false;
-    try { const u = new URL(url); rootPath = u.pathname === '/' || u.pathname === ''; } catch {}
     let res;
-    if (rootPath && await haveCurl()) {
-      res = await curlFetch(url, { ...init, headers, method, body });        // bug A
-    } else {
-      try {
-        res = await nativeFetch(url, { ...init, headers, method, body, redirect: 'manual' });
-      } catch (e) {
-        if (!(await haveCurl())) throw e;
-        res = await curlFetch(url, { ...init, headers, method, body });      // bug B — no response existed
-      }
+    try {
+      res = await nativeFetch(url, { ...init, headers, method, body, redirect: 'manual' });
+    } catch (e) {
+      if ((method !== 'GET' && method !== 'HEAD') || init.signal?.aborted
+          || e?.name === 'AbortError' || !(await haveCurl())) throw e;
+      // curl's failure says less than the runtime's, so the runtime's is the one reported
+      res = await curlFetch(url, { method, headers, signal: init.signal }).catch(() => { throw e; });
     }
     const loc = REDIRECT_CODES.has(res.status) ? res.headers.get('location') : null;
     if (!loc || mode === 'manual') {
@@ -264,8 +285,7 @@ if (nativeFetch) globalThis.fetch = async function fetchRepaired(input, init = {
     if (mode === 'error') throw new TypeError('redirected (redirect: "error")');
     if (hop >= 20) throw new TypeError('too many redirects');
     try { res.body?.cancel(); } catch {}
-    // a hostile Location: must not walk us onto another scheme — curl would
-    // happily fetch file:///etc/passwd
+    // a hostile Location: must not walk us onto another scheme
     const next = new URL(loc, url);
     if (next.protocol !== 'http:' && next.protocol !== 'https:')
       throw new TypeError('redirect to non-http(s) scheme blocked: ' + next.protocol);
@@ -587,7 +607,7 @@ const UNITY_LAUNCHER_GUESS = IS_LINUX &&
 let macFilters = null;
 async function hasMacAudioFilters(query) {
   if (OS !== 'macos' || !query) return false;
-  if (macFilters === null) macFilters = (await query('audiofilters'))?.available === true;
+  macFilters ??= query('audiofilters').then((r) => r?.available === true, () => false);
   return macFilters;
 }
 
@@ -595,16 +615,17 @@ async function hasMacAudioFilters(query) {
 // GlobalShortcuts portal. A property read (like the ScreenCast probe), so it
 // both activates the portal and proves the interface is really there.
 // Probed once. capabilities().globalHotkeys used to say true regardless.
+// The PROMISE is what's cached, here and in the two probes below: every page
+// asks as it boots (tiny.capabilities), so two windows opening together used
+// to start two probes, each seeing the cache still empty.
 let globalShortcuts = null;
 async function hasGlobalShortcuts() {
   if (!IS_LINUX) return false;
   if (ON_X11 && !tjs.env.WAYLAND_DISPLAY) return true;
-  if (globalShortcuts === null) {
-    globalShortcuts = ON_X11 || await probeOk(['gdbus', 'call', '--session',
-      '-d', 'org.freedesktop.portal.Desktop', '-o', '/org/freedesktop/portal/desktop',
-      '-m', 'org.freedesktop.DBus.Properties.Get',
-      'org.freedesktop.portal.GlobalShortcuts', 'version']);
-  }
+  globalShortcuts ??= ON_X11 ? Promise.resolve(true) : probeOk(['gdbus', 'call', '--session',
+    '-d', 'org.freedesktop.portal.Desktop', '-o', '/org/freedesktop/portal/desktop',
+    '-m', 'org.freedesktop.DBus.Properties.Get',
+    'org.freedesktop.portal.GlobalShortcuts', 'version']);
   return globalShortcuts;
 }
 
@@ -613,10 +634,8 @@ async function hasUnityLauncher() {
   // The table below is built on every OS, so answer without spawning anything
   // off Linux. Probed once — a dock does not come and go mid-run.
   if (!IS_LINUX) return false;
-  if (unityLauncher === null) {
-    unityLauncher = (await busNameOwned('com.canonical.Unity'))
-      || (!(await probeOk(['sh', '-c', 'command -v gdbus'])) && UNITY_LAUNCHER_GUESS);
-  }
+  unityLauncher ??= (async () => (await busNameOwned('com.canonical.Unity'))
+    || (!(await probeOk(['sh', '-c', 'command -v gdbus'])) && UNITY_LAUNCHER_GUESS))();
   return unityLauncher;
 }
 
@@ -675,6 +694,13 @@ async function systemCapabilities(query, aiStatus) {
     icon: ON_X11,
     attention: ON_X11,
     presence: ON_X11,
+    // setAlwaysOnTop / setLevel and setAllSpaces go out as keep-above/below
+    // and stick, and GTK3's Wayland backend implements all four as empty
+    // stubs (xdg-shell has no stacking or sticky state) — so they are X11
+    // only, like icon above. (setClickThrough is NOT: the input region is a
+    // real wl_surface request.) From the GTK source, and confirmed with
+    // WAYLAND_DEBUG (TODO-verify.md): the three send nothing.
+    windowLevel: ON_X11, setAllSpaces: ON_X11,
     // chrome.windowControls: GTK can only hide the CLOSE button portably
     // (gtk_window_set_deletable); minimize/maximize go out as _MOTIF_WM_HINTS,
     // which the WM is free to ignore. So: partial, not false.
@@ -973,6 +999,20 @@ const DIALOG_OPS = {
   'dialog.prompt': { op: 'prompt', args: (p) => [one(p.message), one(p.default), one(p.ok), one(p.cancel)] },
 };
 
+const dialogWire = (method, params = {}) => {
+  const dlg = DIALOG_OPS[method];
+  return [dlg.op, ...dlg.args(params)].join('\t');
+};
+
+// Same options contract as tiny.dialog; only the public API name differs.
+const dialogOpts = (fn, opts, strField) => {
+  if (opts == null) return {};
+  if (typeof opts === 'string' && strField) return { [strField]: opts };
+  if (typeof opts === 'object' && !Array.isArray(opts)) return opts;
+  throw new TypeError(`app.dialog.${fn}(message, opts): opts must be an object`
+    + (strField ? ` or a ${strField} string` : '') + `, got ${Array.isArray(opts) ? 'an array' : typeof opts}`);
+};
+
 // Capability gating (tinyjs.json "api"). `tiny` is injected into EVERY
 // origin, so a wrapped third-party site's own JavaScript holds an RPC channel
 // to this backend — the gate is what makes that shippable. Enforced HERE, the
@@ -991,7 +1031,7 @@ const DIALOG_OPS = {
 // The client's own bootstrap. NOT debug.get: it's a raw launcher read-back
 // (clipboard, wifi, frontmost, other windows, selected text...), so under a
 // gate it passes only when a manifest names it (#11).
-const API_ALWAYS = ['client.hello'];
+const API_ALWAYS = ['client.hello', 'client.capabilities'];
 const API_PRESETS = {
   // A site wrapper's posture: OS chrome, windows, dialogs, the app's own
   // store in; filesystem, clipboard READ, secrets, capture and automation out.
@@ -1205,6 +1245,92 @@ export function eventScript(event, data, origin) {
   return '(function(){if(!(' + test + '))return;' + emit + '})()';
 }
 
+// tiny.capabilities (the page's sync can()/list()/get()). tiny.js reads the
+// wire names out of its own functions at boot and asks about exactly those,
+// so this answers per wire name and never lists anything the page didn't
+// name — the app's own api methods stay unnamed to a site that can't call
+// them (capabilities().api.denied used to list them).
+// The gate is checked FIRST: a denied name says only 'gate', so an origin
+// the manifest doesn't trust learns nothing about the machine either.
+// Which capabilities() key each wire name / event rides on. A key that is
+// false makes the name unavailable; one that is absent or truthy doesn't.
+export const CAPABILITY_FEATURES = {
+  'win.setPosition': 'windowPosition', 'app.mouse': 'mousePosition',
+  'app.captureScreen': 'captureScreen',
+  'app.keystroke': 'keystroke', 'app.paste': 'keystroke',
+  'macos.otherWindows': 'otherWindows', 'macos.moveWindow': 'moveOtherWindows',
+  'macos.selectedText': 'selectedText', 'macos.ocr': 'ocr',
+  'macos.recorder.start': 'recorder', 'macos.recorder.stop': 'recorder',
+  'macos.quickLook': 'quickLook', 'macos.applescript': 'applescript',
+  'macos.ai.generate': 'ai', 'win.share': 'share',
+  'system.wifi': 'wifi', 'system.locale': 'locale',
+  'app.authenticate': 'authenticate',
+  'app.badge': 'badge', 'app.progress': 'progress', 'app.icon': 'icon',
+  'app.attention': 'attention', 'app.presence': 'presence',
+  'hotkey.register': 'globalHotkeys', 'hotkey.unregister': 'globalHotkeys',
+  'tray.set': 'tray', 'tray.remove': 'tray', 'tray.position': 'tray',
+  'notify': 'notifications',
+  'nowplaying.set': 'nowPlaying', 'nowplaying.clear': 'nowPlaying',
+  'audioTap.start': 'audioTap', 'audioTap.stop': 'audioTap',
+  'app.say': 'speech', 'app.stopSpeaking': 'speech', 'app.voices': 'speech',
+  'app.pickColor': 'pickColor', 'app.spotlight': 'spotlight',
+  'login.get': 'launchAtLogin', 'login.set': 'launchAtLogin',
+  'win.printToPDF': 'printToPDF',
+  'audio.filters': 'audioFilters', 'audio.filterSet': 'audioFilters',
+  'audio.balance': 'audioFilters',
+  'win.find': 'findInPage', 'win.stopFind': 'findInPage',
+  'win.setAllSpaces': 'setAllSpaces',
+  'win.setAlwaysOnTop': 'windowLevel', 'win.setLevel': 'windowLevel',
+  'secrets.get': 'secrets', 'secrets.set': 'secrets', 'secrets.delete': 'secrets',
+  'media.proxy': 'proxyURL',
+};
+export const EVENT_FEATURES = {
+  tray: 'tray', trayclick: 'tray', hotkey: 'globalHotkeys',
+  'notification-click': 'notifications', 'notification-action': 'notificationActions',
+  'media-key': 'mediaKeys', 'audio-tap': 'audioTap', locale: 'locale',
+};
+// Linux keys that are false because of the session (Wayland, or XWayland's
+// frozen pointer), not the OS — the ON_X11 rows of systemCapabilities' linux
+// table, plus the GlobalShortcuts portal.
+export const SESSION_FEATURES = ['windowPosition', 'mousePosition', 'captureScreen',
+  'keystroke', 'icon', 'attention', 'presence', 'windowControls', 'globalHotkeys',
+  'windowLevel', 'setAllSpaces'];
+// uses: { calls: [wire names], events: [event names] }, from the page.
+// callAllowed(name) / eventAllowed(event): the gate, for the calling origin.
+// platform: systemCapabilities()'s table. linux: on Linux a SESSION_FEATURES
+// key is false because of the session, so it reads 'session' there.
+// -> { calls: { name: true | { why, feature?, needs? } }, events: same }
+//    why: 'gate' (needs = the name to enable in tinyjs.json "api"),
+//         'platform' (this OS can't), 'session' (this Linux session can't)
+export function capabilityVerdicts(uses, { callAllowed, eventAllowed, platform, linux = false }) {
+  const names = (a) => (Array.isArray(a) ? a : [])
+    .filter((n) => typeof n === 'string' && n.length <= 128).slice(0, 1024);
+  const verdict = (allowed, needs, feature) => {
+    if (!allowed) return { why: 'gate', needs };
+    if (feature && platform[feature] === false)
+      return { why: linux && SESSION_FEATURES.includes(feature) ? 'session' : 'platform', feature };
+    return true;
+  };
+  const calls = {}, events = {};
+  for (const n of names(uses?.calls))
+    calls[n] = verdict(callAllowed(n), n, CAPABILITY_FEATURES[n]);
+  for (const e of names(uses?.events))
+    events[e] = verdict(eventAllowed(e), eventGateName(e), EVENT_FEATURES[e]);
+  return { calls, events };
+}
+// Does a TINYJS_MEDIA_ORIGINS line set (mediaTrustLines) trust this origin
+// for `kind`? Same '*' globbing as the launchers, whole origin anchored.
+export function mediaTrusted(lines, kind, origin) {
+  if (typeof origin !== 'string') return false;
+  return String(lines).split('\n').some((l) => {
+    const sp = l.indexOf(' ');
+    if (sp < 0 || l.slice(0, sp) !== kind) return false;
+    const re = '^' + l.slice(sp + 1).split('*')
+      .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$';
+    return new RegExp(re).test(origin);
+  });
+}
+
 // Linux, Wayland session: these permissions guard features that don't exist
 // there (keystroke, captureScreen — capabilities() says so too).
 function linuxUnusablePermission(name) {
@@ -1230,10 +1356,11 @@ export function shellOpenAllowed(target, origin, ownOrigins) {
 
 // getUserMedia consent (#24), and the tiny-media proxy (#30, kind "proxy",
 // pseudo-method media.proxy: a proxied response is CORS-open, so the proxy
-// is a read-anything key). The launcher grants mic/camera silently only to
-// the app's own pages (file://, plus the frontend dev server in dev) and to
-// origins the manifest EXPLICITLY trusts: an "api.origins" key whose gate
-// allows the pseudo-method "media.camera" / "media.microphone". Top-level
+// is a read-anything key), plus kind "file" for the macOS launcher's
+// tiny-media://file/ route (own pages only). The launcher grants mic/camera
+// silently only to the app's own pages (file://, plus the frontend dev
+// server in dev) and to origins the manifest EXPLICITLY trusts: an
+// "api.origins" key whose gate allows the pseudo-method "media.camera" / "media.microphone". Top-level
 // lists and an absent "api" never count — a wrapped site or a redirect target
 // must not inherit the device just because the app itself may use it.
 // Everything else gets the engine's per-origin prompt (macOS) or a denial
@@ -1243,7 +1370,9 @@ export function shellOpenAllowed(target, origin, ownOrigins) {
 // `tinyjs build` writes the same lines into Info.plist (TinyjsMediaOrigins).
 export function mediaTrustLines(spec, ownOrigins) {
   const lines = [];
-  for (const o of ownOrigins) lines.push('camera ' + o, 'microphone ' + o, 'proxy ' + o);
+  // "file" (tiny-media://file/, tiny.fileURL on another volume) is the
+  // app's own pages only: no "api.origins" key can grant it.
+  for (const o of ownOrigins) lines.push('camera ' + o, 'microphone ' + o, 'proxy ' + o, 'file ' + o);
   if (spec && typeof spec === 'object' && !Array.isArray(spec) &&
       spec.origins && typeof spec.origins === 'object') {
     for (const [pat, sub] of Object.entries(spec.origins)) {
@@ -1424,7 +1553,24 @@ function placementFor(list, saved, fallback) {
   const y = Math.max(vy, Math.min(saved.rect.y, vy + v.height - height));
   return { screen: s, x: Math.round(x), y: Math.round(y), width: Math.round(width), height: Math.round(height) };
 }
-export const __screensForTest = { screenAtIn, screenForIn, matchScreenIn, layoutKey, placementFor, screenSnapshot };
+// "600x180" → "600x180" (normalized), anything else → null
+function declaredSize(s) {
+  const m = /^\s*(\d+)\s*x\s*(\d+)\s*$/i.exec(String(s ?? ''));
+  return m ? `${+m[1]}x${+m[2]}` : null;
+}
+// A saved rect remembers the size the user left the window at, but only
+// while the app still declares the size it was saved under: once the
+// developer changes tinyjs.json's "size" (or a win.open size), the new one
+// wins and only the saved position is kept (#106 — a 960x640 saved off the
+// template kept coming back after "size" became 600x180). Entries saved
+// before the size was recorded count as changed, so they reset once.
+function withDeclaredSize(saved, declared) {
+  const d = declaredSize(declared);
+  if (!saved?.rect || !d || saved.declared === d) return saved;
+  const [width, height] = d.split('x').map(Number);
+  return { ...saved, rect: { ...saved.rect, width, height } };
+}
+export const __screensForTest = { screenAtIn, screenForIn, matchScreenIn, layoutKey, placementFor, screenSnapshot, withDeclaredSize };
 
 export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', size = '960x640', version = '0.0.0', tinyjsVersion = 'dev', id = null, launcherPath, api = {}, onMenu, onTray, onHotkey, onContextMenu, onSystem, onOpenUrl, onOpenFiles, onNotificationClick, onNotificationAction, onMediaKey, onWindowClosed, onWindowState, onClipboardChange, onUpdateAvailable, onAudioTap, onLocale, onNavigate, onDownload, onWindowOpen, chrome = null, update = null, activation = null, mainWindow = true, readAccess = null, audioTap = null, windowPlacement = null, contextMenu = true, browserAccelerators = false, debug = false, about = null, userAgent = null, urlScheme = null, fileExtensions = null, openFolders = false, permissions = null, offscreenRescue = null, downloads = null, popups = null, apiAccess = null, inject = null, resourcesPath = null, executablesPath = null, rememberWindows = false }) {
   if (typeof mainWindow !== 'boolean') throw new Error('mainWindow must be a boolean');
@@ -1656,7 +1802,10 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
           (b) => b.toString(16).padStart(2, '0')).join('')
       : null;
     if (pipeToken) spawnEnv.TINYJS_PIPE_TOKEN = pipeToken;
-    const spawnOpts = { stderr: 'inherit', env: spawnEnv };
+    // stdin stays explicit: a double-clicked Windows build has no std handles,
+    // and txiki 26.11.0's spawn then throws UNKNOWN if all three streams are
+    // inherited. The launcher never reads it, and it keeps stdout/stderr for dev.
+    const spawnOpts = { stdin: 'ignore', stderr: 'inherit', env: spawnEnv };
     // macOS: a bare (non-bundled) binary takes its OS-facing app name — menu
     // bar, cmd-tab — from the executable's file name. In dev that reads
     // "launcher". Exec through a symlink named after the app instead, so the
@@ -1745,14 +1894,15 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
     });
   }
   const query = (what) => ask('GET', what);
-  // A save panel whose answer comes back HERE, not to a page (#36): the DLG
-  // id is q<qid>, which every launcher answers as GOT <qid> <path|null>.
+  // A dialog whose answer comes back HERE, not to a page: the DLG id is
+  // q<qid>, which every launcher answers as GOT <qid> <json>.
   // Page call ids can't take that shape (they carry ':' or are hex).
-  function askSavePath(name) {
+  function askDialog(method, params, saveFolder = '') {
     return new Promise((resolve) => {
       const qid = String(qidSeq++);
+      const body = dialogWire(method, params);
       pendingGets.set(qid, resolve);
-      send(`DLG q${qid} save\tpdf\t${one(name)}`);
+      send(`DLG q${qid} ${body}${saveFolder ? '\t' + saveFolder : ''}`);
     });
   }
 
@@ -1781,7 +1931,7 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
       if (inside) return IS_WIN ? abs.replace(/\//g, '\\') : abs;
     }
     const name = p.replace(/^.*[\\/]/, '') || 'page.pdf';
-    const picked = await askSavePath(name);
+    const picked = await askDialog('dialog.saveFile', { types: ['pdf'], name }, 'downloads');
     if (!picked) throw new Error('printToPDF: cancelled');
     return picked;
   }
@@ -1798,20 +1948,32 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
   // launcher draws them: macOS as real responder-chain items, Linux through
   // WebKitGTK's editing commands, Windows by replaying the shortcut into
   // WebView2. The tray skips them (nothing to edit there).
+  //
+  // icon? is optional and decorative: a png path (absolute or project-
+  // relative), 'sf:<name>' for an SF Symbol (macOS only) or 'emoji:<glyph>'
+  // for a colour emoji drawn at menu size (no asset). A launcher that
+  // can't draw it (sf: off macOS, a GTK theme hiding menu images) shows the
+  // label alone, so apps can set it everywhere.
   const STOCK_ROLES = new Set(['standard', 'undo', 'redo', 'cut', 'copy', 'paste', 'selectAll']);
+  const menuIcon = (icon) => {
+    icon = icon ? String(icon) : '';
+    if (icon && !isAbs(icon) && !/^(sf|emoji):/.test(icon)) icon = tjs.cwd + '/' + icon;
+    return one(icon);
+  };
 
   function sendItems(items) {
     for (const it of items ?? []) {
       if (it.role) { if (STOCK_ROLES.has(it.role)) send('ROLEITEM ' + it.role); continue; }
       if (it.separator) { send('SEP'); continue; }
       if (it.submenu) {
-        send('SUB ' + [one(it.id), one(it.label ?? it.id)].join('\t'));
+        send('SUB ' + [one(it.id), one(it.label ?? it.id), menuIcon(it.icon)].join('\t'));
         sendItems(it.submenu);
         send('SUBEND');
         continue;
       }
       const flags = (it.checked ? 'c' : '') + (it.enabled === false ? 'd' : '');
-      send('ITEM ' + [one(it.id), one(it.label ?? it.id), one(it.key ?? ''), flags].join('\t'));
+      send('ITEM ' + [one(it.id), one(it.label ?? it.id), one(it.key ?? ''), flags,
+                      menuIcon(it.icon)].join('\t'));
     }
   }
 
@@ -2061,6 +2223,10 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
   const placeStore = rememberWindows ? makeStore(id, 'window-state.json') : null;
   let placeLayouts = null;                 // in memory once loaded (sync reads)
   const placeTimers = new Map();
+  const pendingShowState = new Map();      // win id -> deferred applyPlacementState (show:false)
+  // win id -> the size the app declares for it (tinyjs.json / win.open),
+  // saved beside each rect — see withDeclaredSize
+  const declaredSizes = new Map([['main', size]]);
   const MAX_LAYOUTS = 8;
   function placementDirty(wid) {
     clearTimeout(placeTimers.get(wid));
@@ -2083,11 +2249,13 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
     const prev = lay.windows[wid];
     const s = list.find((o) => o.id === st.screenId) ??
       screenForIn(list, { x: st.x, y: st.y, width: st.outer?.width ?? st.width, height: st.outer?.height ?? st.height });
-    const entry = { screen: prev?.screen ?? null, rect: prev?.rect ?? null, maximized, fullscreen };
+    // a kept (maximized/fullscreen) rect keeps the declared size it was saved under
+    const entry = { screen: prev?.screen ?? null, rect: prev?.rect ?? null, declared: prev?.declared ?? null, maximized, fullscreen };
     if (s && (maximized || fullscreen)) entry.stateScreen = screenSnapshot(list, s);
     else if (s) {
       entry.screen = screenSnapshot(list, s);
       entry.rect = { x: st.local?.x ?? st.x - s.x, y: st.local?.y ?? st.y - s.y, width: st.width, height: st.height };
+      entry.declared = declaredSize(declaredSizes.get(wid));
     }
     lay.windows[wid] = entry;
     lay.used = Date.now();
@@ -2100,13 +2268,13 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
   function savedPlacement(wid, list) {
     if (!placeLayouts) return null;
     const exact = placeLayouts[layoutKey(list)]?.windows?.[wid];
-    if (exact) return exact;
+    if (exact) return withDeclaredSize(exact, declaredSizes.get(wid));
     let best = null, used = -1;
     for (const lay of Object.values(placeLayouts)) {
       const e = lay?.windows?.[wid];
       if (e && (lay.used || 0) > used) { best = e; used = lay.used || 0; }
     }
-    return best;
+    return withDeclaredSize(best, declaredSizes.get(wid));
   }
   // maximized / fullscreen go back on top of the restored normal rect
   function applyPlacementState(wid, saved, list, onto) {
@@ -2201,6 +2369,16 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
     restore() { send('WINOP restore'); },
     setFullscreen(v, opts) { app.window('main').setFullscreen(v, opts); },
     notify,
+    // Application-modal panels also work without a main window or WebView.
+    dialog: {
+      openFile: (opts = {}) => askDialog('dialog.openFile', { types: opts.types }),
+      openFiles: (opts = {}) => askDialog('dialog.openFiles', { types: opts.types }),
+      pickFolder: () => askDialog('dialog.pickFolder'),
+      saveFile: (opts = {}) => askDialog('dialog.saveFile', { types: opts.types, name: opts.name }),
+      alert: async (message, opts) => askDialog('dialog.alert', { message, ...dialogOpts('alert', opts, 'detail') }),
+      confirm: async (message, opts) => askDialog('dialog.confirm', { message, ...dialogOpts('confirm', opts, 'detail') }),
+      prompt: async (message, opts) => askDialog('dialog.prompt', { message, ...dialogOpts('prompt', opts) }),
+    },
     // Window visibility & app presence. hide() hides the APP (NSApp hide):
     // macOS returns focus to the previously active app on its own, so
     // hide-then-paste palettes need no frontmost-tracking. show() re-activates;
@@ -2981,11 +3159,15 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
     // also minimizes/hides with the parent, closes when the parent closes, and
     // on Windows/Linux gets no taskbar entry of its own. Open-time only, like
     // `transparent` — ownership doesn't retrofit on Windows.
+    // show: false creates, places (remembered placement included) and loads
+    // the window but keeps it off screen until show() — the way to fill a
+    // window before anyone sees it. A remembered maximize/fullscreen waits
+    // for that first show too (applying it would show the window) (#102).
     // 'main' names the launcher's own window: open('main') shows + focuses
     // it like open() on any existing id (opts ignored), and throws under
     // mainWindow: false, where the launchers used to drop it silently
     // (macOS/Linux) or build a half-wired window (Windows).
-    openWindow(id, { page, title, size, minSize, chrome, x, y, parent, screen, units } = {}) {
+    openWindow(id, { page, title, size, minSize, chrome, x, y, parent, screen, units, show } = {}) {
       if (String(id ?? '') === 'main') {
         if (!mainWindow)
           throw new Error("win.open: there is no 'main' window under mainWindow: false — open yours under another id");
@@ -3021,6 +3203,7 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
       // rememberWindows: a window opened without an explicit place goes back
       // where it last was (on this layout of screens, or the closest match)
       let restored = null;
+      declaredSizes.set(String(id), size ?? '600x400');
       if (rememberWindows && x == null && y == null && after == null && screensCache) {
         restored = savedPlacement(String(id), screensCache);
         const p = placementFor(screensCache, restored, null);
@@ -3035,13 +3218,18 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
                          bit(c.menu),
                          wcp ? `${wcp.x | 0},${wcp.y | 0}` : '',
                          one(parent === true ? 'main' : parent || ''),
-                         c.panel ? '1' : ''].join('\t'));
+                         c.panel ? '1' : '',
+                         show === false ? '0' : ''].join('\t'));
       // minSize: "WxH" — a floor under user resizes, so a layout with a
       // natural size can't be shrunk until content falls off the bottom.
       if (minSize) send('WINOP@' + one(id) + ' minsize ' + one(minSize));
       if (after) send('WINOP@' + one(id) + ' ' + after);
-      if (restored) applyPlacementState(String(id), restored, screensCache,
-        screensCache.find((o) => x != null && o.x <= x && x < o.x + o.width) ?? null);
+      if (restored) {
+        const onto = screensCache.find((o) => x != null && o.x <= x && x < o.x + o.width) ?? null;
+        const apply = () => applyPlacementState(String(id), restored, screensCache, onto);
+        if (show === false && (restored.maximized || restored.fullscreen)) pendingShowState.set(String(id), apply);
+        else apply();
+      }
       // a window BORN at a restored position is the classic stale-coordinates
       // case — same chase as a first setPosition (armed boots only)
       if (hasPos) rescueNote(id, 'pos');
@@ -3069,7 +3257,14 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
         // hide({ app: false }) orders this window out on its own; a bare
         // hide() on 'main' still hides the whole app (see app.hide above).
         hide: (opts) => t('WINOP', opts?.app === false ? 'hidewin' : 'hide'),
-        show: (opts) => { t('WINOP', 'show' + (opts?.activate === false ? ' 0' : '')); rescueNote(id, 'show'); },
+        show: (opts) => {
+          t('WINOP', 'show' + (opts?.activate === false ? ' 0' : ''));
+          rescueNote(id, 'show');
+          // a show:false window's remembered maximize/fullscreen, held back
+          // so applying it didn't show the window early
+          const pend = pendingShowState.get(String(id));
+          if (pend) { pendingShowState.delete(String(id)); pend(); }
+        },
         minimize: () => t('WINOP', 'minimize'),
         restore: () => t('WINOP', 'restore'),
         zoom: () => t('WINOP', 'zoom'),
@@ -3713,6 +3908,21 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
     'system.locale': async () => app.system.locale(),
     'app.info': async () => app.info(),
     'system.info': async () => app.system.info(),
+    // tiny.capabilities' snapshot: a verdict for each name the page's tiny.js
+    // uses (capabilityVerdicts). Always allowed, like client.hello — it can't
+    // tell a page more than calling would, and a gated page needs it most.
+    'client.capabilities': async (uses, _a, m) => {
+      const origin = m?.origin;
+      const own = origin === undefined || String(origin).startsWith('file://') || ownPageOrigins.has(origin);
+      const allows = (name) => !apiGate || apiGate(name, origin);
+      return capabilityVerdicts(uses, {
+        callAllowed: (n) => n === 'media.proxy'
+          ? own || mediaTrusted(mediaLines, 'proxy', origin) : allows(n),
+        eventAllowed: (e) => eventAllowed(origin, e),
+        platform: await systemCapabilities(query, () => app.macos.ai.availability()),
+        linux: IS_LINUX,
+      });
+    },
     'system.capabilities': async (_p, _a, m) => ({
       ...(await systemCapabilities(query, () => app.macos.ai.availability())),
       // what the "api" gate denies the CALLING origin (empty when ungated)
@@ -3768,6 +3978,12 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
   const methods = { ...api, ...builtins };
   const apiGate = compileApiGate(apiAccess);
   const subframeGate = compileSubframeGate(apiAccess);
+  const mediaLines = mediaTrustLines(apiAccess, [...ownPageOrigins]);
+  // Every page asks tiny.capabilities as it boots, and on Linux the answer
+  // spawns D-Bus probes (portal, dock) that can be slow — start them now, so
+  // the first page finds them done or in flight. (macOS's one probe asks the
+  // launcher, which isn't connected yet; it's a fast round trip anyway.)
+  if (IS_LINUX) systemCapabilities(null, null).catch(() => {});
   // capabilities() reports what the gate denies THE CALLING ORIGIN, so a
   // page can hide UI for features it would only watch fail.
   const gateInfo = (origin) => {
@@ -3837,7 +4053,7 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
       // on the UI thread and resolves the page's promise itself.
       const dlg = DIALOG_OPS[method];
       if (dlg) {
-        send(`DLG ${id} ${[dlg.op, ...dlg.args(params ?? {})].join('\t')}`);
+        send(`DLG ${id} ${dialogWire(method, params ?? {})}`);
         return;
       }
 
@@ -3999,6 +4215,7 @@ export async function createApp({ html, htmlPath, url = null, title = 'tinyjs', 
           if (audioTapOwner === id) stopAudioTap();
           clipWatch('win:' + id, 0);
           winOrigins.delete(id);
+          pendingShowState.delete(id);   // closed before its first show
           push('window-closed', { id });
           fire('onWindowClosed', onWindowClosed, id, app);
         } else if (line.startsWith('WINGEOM ')) {
